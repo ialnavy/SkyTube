@@ -20,36 +20,48 @@ package free.rm.skytube.app;
 import android.content.Context;
 import android.net.Uri;
 
-import org.schabi.newpipe.extractor.MediaFormat;
 import org.schabi.newpipe.extractor.stream.AudioStream;
 import org.schabi.newpipe.extractor.stream.AudioTrackType;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.VideoStream;
 
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
 import java.util.List;
 
 import free.rm.skytube.R;
 import free.rm.skytube.BuildConfig;
+import free.rm.skytube.app.stream.Resolutions;
+import free.rm.skytube.app.stream.rank.FormatPreference;
+import free.rm.skytube.app.stream.rank.StreamRanking;
+import free.rm.skytube.app.stream.spec.AudioTrackIs;
+import free.rm.skytube.app.stream.spec.DirectUrl;
+import free.rm.skytube.app.stream.spec.FormatIn;
+import free.rm.skytube.app.stream.spec.ResolutionWithin;
+import free.rm.skytube.app.stream.spec.StreamSpec;
 import free.rm.skytube.businessobjects.Logger;
 import free.rm.skytube.businessobjects.YouTube.VideoStream.VideoQuality;
 import free.rm.skytube.businessobjects.YouTube.VideoStream.VideoResolution;
 
 public class StreamSelectionPolicy {
-    private final static List<MediaFormat> VIDEO_FORMAT_QUALITY = Arrays.asList(MediaFormat.WEBM, MediaFormat.MPEG_4, MediaFormat.v3GPP);
 
     private final boolean allowVideoOnly;
     private final VideoResolution maxResolution;
     private final VideoResolution minResolution;
     private final VideoQuality videoQuality;
+    private final StreamRanking ranking;
+    private final StreamSpec<VideoStream> videoSpec;
+    private final StreamSpec<AudioStream> audioSpec;
 
     public StreamSelectionPolicy(boolean allowVideoOnly, VideoResolution maxResolution, VideoResolution minResolution, VideoQuality videoQuality) {
         this.allowVideoOnly = allowVideoOnly;
         this.maxResolution = maxResolution != VideoResolution.RES_UNKNOWN ? maxResolution : null;
         this.minResolution = minResolution != VideoResolution.RES_UNKNOWN ? minResolution : null;
         this.videoQuality = videoQuality;
+        this.ranking = StreamRanking.forQuality(videoQuality);
+        this.videoSpec = new DirectUrl<VideoStream>()
+                .and(new FormatIn<VideoStream>(FormatPreference.SUPPORTED_VIDEO_CONTAINERS))
+                .and(new ResolutionWithin(this.minResolution, this.maxResolution));
+        this.audioSpec = new AudioTrackIs(AudioTrackType.ORIGINAL);
     }
 
     public StreamSelectionPolicy withAllowVideoOnly(boolean newValue) {
@@ -57,18 +69,16 @@ public class StreamSelectionPolicy {
     }
 
     public StreamSelection select(StreamInfo streamInfo) {
-        VideoStreamWithResolution videoStreamWithResolution = pickVideo(streamInfo);
-        if (videoStreamWithResolution != null) {
-            if (videoStreamWithResolution.videoStream.isVideoOnly()) {
-                AudioStream audioStream = pickAudio(streamInfo);
-                if (audioStream != null) {
-                    return new StreamSelection(videoStreamWithResolution.videoStream, videoStreamWithResolution.resolution, audioStream);
-                }
-            } else {
-                return new StreamSelection(videoStreamWithResolution.videoStream, videoStreamWithResolution.resolution, null);
-            }
+        VideoStream videoStream = pickVideo(streamInfo);
+        if (videoStream == null) {
+            return null;
         }
-        return null;
+        VideoResolution resolution = Resolutions.of(videoStream);
+        if (!videoStream.isVideoOnly()) {
+            return new StreamSelection(videoStream, resolution, null);
+        }
+        AudioStream audioStream = pickAudio(streamInfo);
+        return audioStream != null ? new StreamSelection(videoStream, resolution, audioStream) : null;
     }
 
     @Override
@@ -98,21 +108,36 @@ public class StreamSelectionPolicy {
         return context.getString(R.string.video_stream_not_found_with_request_resolution, min, max);
     }
 
+    private VideoStream pickVideo(StreamInfo streamInfo) {
+        List<VideoStream> streams = new ArrayList<>(streamInfo.getVideoStreams());
+        if (allowVideoOnly) {
+            streams.addAll(streamInfo.getVideoOnlyStreams());
+        }
+        if (BuildConfig.DEBUG) {
+            for (VideoStream stream : streams) {
+                Logger.d(this, "found %s", toHumanReadable(stream));
+            }
+        }
+        VideoStream best = streams.stream()
+                .filter(videoSpec.asPredicate())
+                .min(ranking.videoOrder())
+                .orElse(null);
+        if (BuildConfig.DEBUG) {
+            Logger.d(this, "best -> %s", toHumanReadable(best));
+        }
+        return best;
+    }
+
     private AudioStream pickAudio(StreamInfo streamInfo) {
         if (BuildConfig.DEBUG) {
-            for (AudioStream vs : streamInfo.getAudioStreams()) {
-                Logger.d(this, "AudioStream %s", toHumanReadable(vs));
+            for (AudioStream stream : streamInfo.getAudioStreams()) {
+                Logger.d(this, "AudioStream %s", toHumanReadable(stream));
             }
         }
-        AudioStream best = null;
-        for (AudioStream audioStream : streamInfo.getAudioStreams()) {
-            if (isOriginalAudio(audioStream) && isBetter(best, audioStream)) {
-                if (BuildConfig.DEBUG) {
-                    Logger.d(this, "better %s -> %s", toHumanReadable(best), toHumanReadable(audioStream));
-                }
-                best = audioStream;
-            }
-        }
+        AudioStream best = streamInfo.getAudioStreams().stream()
+                .filter(audioSpec.asPredicate())
+                .min(ranking.audioOrder())
+                .orElse(null);
         if (BuildConfig.DEBUG) {
             Logger.d(this, "best %s", toHumanReadable(best));
         }
@@ -123,132 +148,14 @@ public class StreamSelectionPolicy {
         return as != null ? "AudioStream(" + as.getAverageBitrate() + ", " + as.getFormat() + ", codec=" + as.getCodec() + ", q=" + as.getQuality() + ", isUrl=" + as.isUrl() + ",delivery=" + as.getDeliveryMethod() + ")" : "NULL";
     }
 
-    private static boolean isOriginalAudio(AudioStream audioStream) {
-        AudioTrackType trackType = audioStream.getAudioTrackType();
-        // Accept streams with ORIGINAL type, or with null type (unknown/legacy)
-        return trackType == null || trackType == AudioTrackType.ORIGINAL;
-    }
-
-    private boolean isBetter(AudioStream best, AudioStream other) {
-        if (best == null) {
-            return true;
-        }
-        switch (videoQuality) {
-            case LEAST_BANDWIDTH:
-                return other.getAverageBitrate() < best.getAverageBitrate();
-            case BEST_QUALITY:
-                return best.getAverageBitrate() < other.getAverageBitrate();
-        }
-        throw new IllegalStateException("Unexpected videoQuality:" + videoQuality);
-    }
-
-    private static boolean isSecondBetterFormat(VideoStream stream1, VideoStream stream2) {
-        final int format1Idx = VIDEO_FORMAT_QUALITY.indexOf(stream1.getFormat());
-        final int format2Idx = VIDEO_FORMAT_QUALITY.indexOf(stream2.getFormat());
-        if (format2Idx < 0) {
-            return false;
-        }
-        if (format1Idx < 0) {
-            return true;
-        }
-        return (format2Idx < format1Idx);
-    }
-
-    private VideoStreamWithResolution pickVideo(StreamInfo streamInfo) {
-        List<VideoStream> streams = streamInfo.getVideoStreams();
-        if (allowVideoOnly) {
-            streams = new ArrayList<>(streams);
-            streams.addAll(streamInfo.getVideoOnlyStreams());
-        }
-        if (BuildConfig.DEBUG) {
-            for (VideoStream vs : streams) {
-                Logger.d(this, "found %s", VideoStreamWithResolution.toHumanReadable(vs));
-            }
-        }
-        return pick(streams);
-    }
-
-    private VideoStreamWithResolution pick(Collection<VideoStream> streams) {
-        VideoStreamWithResolution best = null;
-        for (VideoStream stream : streams) {
-            VideoStreamWithResolution videoStream = new VideoStreamWithResolution(stream);
-            if (isAllowed(videoStream.resolution) && isAllowedVideoFormat(videoStream.videoStream.getFormat()) && stream.isUrl()) {
-                switch (videoQuality) {
-                    case BEST_QUALITY:
-                        if (videoStream.isBetterQualityThan(best)) {
-                            if (BuildConfig.DEBUG) {
-                                Logger.d(this, "better quality %s -> %s", VideoStreamWithResolution.toHumanReadable(best), VideoStreamWithResolution.toHumanReadable(videoStream));
-                            }
-                            best = videoStream;
-                        }
-                        break;
-                    case LEAST_BANDWIDTH:
-                        if (videoStream.isLessNetworkUsageThan(best)) {
-                            if (BuildConfig.DEBUG) {
-                                Logger.d(this, "less network %s -> %s", VideoStreamWithResolution.toHumanReadable(best), VideoStreamWithResolution.toHumanReadable(videoStream));
-                            }
-                            best = videoStream;
-                        }
-                        break;
-                }
-            }
-        }
-        if (BuildConfig.DEBUG) {
-            Logger.d(this, "best -> %s", VideoStreamWithResolution.toHumanReadable(best));
-        }
-        return best;
-    }
-
-    private boolean isAllowed(VideoResolution resolution) {
-        if (minResolution != null && minResolution.isBetterQualityThan(resolution)) {
-            return false;
-        }
-
-        if (maxResolution != null && resolution.isBetterQualityThan(maxResolution)) {
-            return false;
-        }
-
-        return true;
-    }
-
-    private boolean isAllowedVideoFormat(MediaFormat format) {
-        return VIDEO_FORMAT_QUALITY.contains(format);
-    }
-
-    private static class VideoStreamWithResolution {
-        final VideoStream videoStream;
-        final VideoResolution resolution;
-
-        VideoStreamWithResolution(VideoStream videoStream) {
-            this.videoStream = videoStream;
-            this.resolution = VideoResolution.resolutionToVideoResolution(videoStream.getResolution());
-        }
-
-        boolean isBetterQualityThan(VideoStreamWithResolution other) {
-            return other == null || resolution.isBetterQualityThan(other.resolution) || (resolution == other.resolution && isSecondBetterFormat(other.videoStream, videoStream));
-        }
-
-        boolean isLessNetworkUsageThan(VideoStreamWithResolution other) {
-            return other == null || resolution.isLessNetworkUsageThan(other.resolution) || (resolution == other.resolution && isSecondBetterFormat(other.videoStream, videoStream));
-        }
-
-        private String toHumanReadable() {
-            return "VideoStream(" + resolution.name() +
-                    ", format=" + videoStream.getFormat() +
-                    ", codec=" + videoStream.getCodec() +
-                    ", quality=" + videoStream.getQuality() +
-                    ",videoOnly=" + videoStream.isVideoOnly() +
-                    ",isUrl=" + videoStream.isUrl() +
-                    ",delivery=" + videoStream.getDeliveryMethod() + ")";
-        }
-
-        private static String toHumanReadable(VideoStreamWithResolution v) {
-            return v != null ? v.toHumanReadable() : "NULL";
-        }
-
-        private static String toHumanReadable(VideoStream v) {
-            return v != null ? new VideoStreamWithResolution(v).toHumanReadable() : "NULL";
-        }
+    private static String toHumanReadable(VideoStream vs) {
+        return vs != null ? "VideoStream(" + Resolutions.of(vs).name() +
+                ", format=" + vs.getFormat() +
+                ", codec=" + vs.getCodec() +
+                ", quality=" + vs.getQuality() +
+                ",videoOnly=" + vs.isVideoOnly() +
+                ",isUrl=" + vs.isUrl() +
+                ",delivery=" + vs.getDeliveryMethod() + ")" : "NULL";
     }
 
     public static class StreamSelection {

@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.schabi.newpipe.extractor.MediaFormat;
+import org.schabi.newpipe.extractor.stream.AudioStream;
+import org.schabi.newpipe.extractor.stream.AudioTrackType;
 import org.schabi.newpipe.extractor.stream.DeliveryMethod;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamType;
@@ -54,6 +56,91 @@ public class StreamSelectionPolicyTest {
         test(policy, MediaFormat.MPEG_4, MediaFormat.VTT, MediaFormat.MPEG_4);
     }
 
+    @Test
+    void testVideoOnlyStreamsAreIgnoredWhenNotAllowed() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(false, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.BEST_QUALITY);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoOnlyStreams(createVideoStreams(true, "1080P"));
+        streamInfo.setAudioStreams(Arrays.asList(createAudioStream(128, AudioTrackType.ORIGINAL)));
+
+        Assertions.assertNull(policy.select(streamInfo), "Video only streams must not be used by a policy which forbids them");
+    }
+
+    @Test
+    void testVideoOnlyStreamIsMergedWithTheBestOriginalAudio() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(true, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.BEST_QUALITY);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoStreams(createVideoStreams(false, "480P"));
+        streamInfo.setVideoOnlyStreams(createVideoStreams(true, "1080P"));
+        streamInfo.setAudioStreams(Arrays.asList(
+                createAudioStream(128, AudioTrackType.ORIGINAL),
+                createAudioStream(256, AudioTrackType.ORIGINAL)));
+
+        StreamSelectionPolicy.StreamSelection selection = policy.select(streamInfo);
+        Assertions.assertEquals("1080P", selection.getVideoStream().resolution);
+        Assertions.assertEquals(256, selection.getAudioStream().getAverageBitrate());
+    }
+
+    @Test
+    void testVideoOnlyStreamIsRejectedWithoutAnOriginalAudioTrack() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(true, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.BEST_QUALITY);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoOnlyStreams(createVideoStreams(true, "1080P"));
+        streamInfo.setAudioStreams(Arrays.asList(createAudioStream(256, AudioTrackType.DUBBED)));
+
+        Assertions.assertNull(policy.select(streamInfo), "A video only stream is unusable without an audio track");
+    }
+
+    @Test
+    void testDubbedAudioTracksAreIgnoredAndUnknownOnesAccepted() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(true, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.BEST_QUALITY);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoOnlyStreams(createVideoStreams(true, "1080P"));
+        streamInfo.setAudioStreams(Arrays.asList(
+                createAudioStream(320, AudioTrackType.DUBBED),
+                createAudioStream(192, null),
+                createAudioStream(128, AudioTrackType.ORIGINAL)));
+
+        StreamSelectionPolicy.StreamSelection selection = policy.select(streamInfo);
+        Assertions.assertEquals(192, selection.getAudioStream().getAverageBitrate());
+    }
+
+    @Test
+    void testLeastBandwidthPicksTheLowestAudioBitrate() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(true, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.LEAST_BANDWIDTH);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoOnlyStreams(createVideoStreams(true, "480P"));
+        streamInfo.setAudioStreams(Arrays.asList(
+                createAudioStream(256, AudioTrackType.ORIGINAL),
+                createAudioStream(128, AudioTrackType.ORIGINAL)));
+
+        StreamSelectionPolicy.StreamSelection selection = policy.select(streamInfo);
+        Assertions.assertEquals(128, selection.getAudioStream().getAverageBitrate());
+    }
+
+    @Test
+    void testStreamsWithoutADirectUrlAreIgnored() {
+        StreamSelectionPolicy policy = new StreamSelectionPolicy(false, VideoResolution.RES_1080P, VideoResolution.RES_480P, VideoQuality.BEST_QUALITY);
+
+        StreamInfo streamInfo = createStreamInfo();
+        streamInfo.setVideoStreams(Arrays.asList(
+                new VideoStream.Builder()
+                        .setId("manifest-1080P")
+                        .setContent("<manifest/>", false)
+                        .setMediaFormat(MediaFormat.WEBM)
+                        .setResolution("1080P")
+                        .setIsVideoOnly(false)
+                        .setDeliveryMethod(DeliveryMethod.DASH)
+                        .build()));
+
+        Assertions.assertNull(policy.select(streamInfo), "A stream whose content is a manifest cannot be played directly");
+    }
+
     private void test(StreamSelectionPolicy policy, String expectedResolution, String... resolutions) {
         StreamInfo streamInfo = createStreams(resolutions);
         StreamSelectionPolicy.StreamSelection selection = policy.select(streamInfo);
@@ -91,19 +178,34 @@ public class StreamSelectionPolicyTest {
     }
 
     private StreamInfo createStreams(String... resolutions) {
+        return createStreams(createVideoStreams(false, resolutions));
+    }
+
+    private List<VideoStream> createVideoStreams(boolean videoOnly, String... resolutions) {
         List<VideoStream> streams = new ArrayList<>();
         for (String resolution : resolutions) {
             streams.add(
                 new VideoStream.Builder()
-                    .setId("id-"+resolution.hashCode())
+                    .setId("id-" + resolution.hashCode() + (videoOnly ? "-videoonly" : ""))
                     .setContent("url/" + resolution, true)
                     .setMediaFormat(MediaFormat.WEBM)
                     .setResolution(resolution)
-                    .setIsVideoOnly(false)
+                    .setIsVideoOnly(videoOnly)
                     .setDeliveryMethod(DeliveryMethod.DASH)
                     .build());
         }
-        return createStreams(streams);
+        return streams;
+    }
+
+    private AudioStream createAudioStream(int averageBitrate, AudioTrackType trackType) {
+        return new AudioStream.Builder()
+            .setId("audio-" + averageBitrate + "-" + trackType)
+            .setContent("url/audio/" + averageBitrate, true)
+            .setMediaFormat(MediaFormat.M4A)
+            .setAverageBitrate(averageBitrate)
+            .setAudioTrackType(trackType)
+            .setDeliveryMethod(DeliveryMethod.DASH)
+            .build();
     }
 
     private StreamInfo createStreams(List<VideoStream> streams) {
